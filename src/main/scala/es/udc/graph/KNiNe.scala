@@ -79,6 +79,7 @@ Options:
         """)
     -t    Maximum comparisons per item (default: auto)
     -c    File containing the graph to compare to (default: nothing)
+    -g    Redirect stdout and stderr to a file
 
 Advanced LSH options:
     -n    Number of hashes per item (default: auto)
@@ -111,21 +112,23 @@ Advanced LSH options:
         case "l" => "key_length"
         case "t" => "max_comparisons"
         case "c" => "compare"
+        case "g" => "log"
         case somethingElse => readOptionName
       }
       if (!m.keySet.exists(_ == option) && option == readOptionName) {
         println("Unknown option:" + readOptionName)
         showUsageAndExit()
       }
-      if (option == "method") {
+      if (option == "log") {
+        m(option) = p(i + 1)
+      } else if (option == "method") {
         if (p(i + 1) == "lsh" || p(i + 1) == "brute")
           m(option) = p(i + 1)
         else {
           println("Unknown method:" + p(i + 1))
           showUsageAndExit()
         }
-      }
-      else {
+      } else {
         if (option == "compare")
           m(option) = p(i + 1)
         else
@@ -169,6 +172,14 @@ Advanced LSH options:
 
     //Set up Spark Context
     val sc = sparkContextSingleton.getInstance()
+
+    if (options.exists(_._1 == "log")) {
+      val log = options("log").asInstanceOf[String]
+      val path = new org.apache.hadoop.fs.Path(log + "." + sc.applicationId)
+      val logstream = org.apache.hadoop.fs.FileSystem.get(sc.hadoopConfiguration).create(path)
+      System.setOut(new java.io.PrintStream(logstream, true))
+      System.setErr(new java.io.PrintStream(logstream, true))
+    }
 
     //Stop annoying INFO messages
     val rootLogger = Logger.getRootLogger()
@@ -299,6 +310,7 @@ Advanced LSH options:
     }
     /**/
     //Stop the Spark Context
+    System.out.close()
     sc.stop()
   }
 
