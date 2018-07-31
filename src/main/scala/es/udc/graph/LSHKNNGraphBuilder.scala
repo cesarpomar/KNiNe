@@ -220,40 +220,130 @@ abstract class LSHKNNGraphBuilder {
     return fullGraph.map({ case (node, (viewed, neighs)) => (node, neighs) })
   }
 
-  def computeGroupedGraph(data: RDD[(LabeledPoint, Long)], numNeighbors: Int, dimension: Int, hasherKeyLength: Int, hasherNumTables: Int, startRadius: Double, maxComparisonsPerItem: Int, measurer: DistanceProvider, grouper: GroupingProvider): RDD[(Long, List[(Int, List[(Long, Double)])])]
+  protected final def getHashes(data: RDD[(Long, LabeledPoint)], hasher: Hasher, radius: Double): RDD[(Hash, Long)] = {
+    data.flatMap({ case (index, point) => hasher.getHashes(point.features, index, radius) });
+  }
+
+  def computeBestKeyLength(data: RDD[(LabeledPoint, Long)], keyLength: Int, hasher: Hasher, startRadius: Double): (Int, Double) = {
+    val currentData = data.map(_.swap)
+    var tmpHasher = hasher
+    var radius = startRadius
+    var tmpHash = getHashes(currentData, hasher, radius)
+    var update = false
+    var upFlag = false
+    var downFlag = false
+
+    do {
+      update = false
+      if (tmpHasher.keyLength < hasher.keyLength) {
+        tmpHash = tmpHash.map({ case (hash, index) =>
+          (hash.cutLen(tmpHasher.keyLength), index)
+        });
+      } else if (tmpHasher.keyLength != hasher.keyLength) {
+        tmpHash = getHashes(currentData, tmpHasher, radius)
+      }
+      /*
+            val hashBuckets = tmpHash.groupByKey()
+              .map({ case (k, l) => (k, l.toSet) })
+              .map({ case (k, s) => (k, s, s.size) })
+
+            val numBuckets = hashBuckets.count()
+            val stepOps = hashBuckets.map({ case (h, s, n) => (n, 1) }).reduceByKey(_ + _)
+      */
+      val stepOps = tmpHash.aggregateByKey(0)({ case (n, index) => n + 1 }, { case (n1, n2) => n1 + n2 })
+        .map({ case (h, n) => (n, 1) }).reduceByKey(_ + _).filter({ case (n1, x) => n1 != 1 })
+
+      val numBuckets = if (stepOps.isEmpty()) 0 else stepOps.reduce({ case ((n1, x), (n2, y)) => (n1 + n2, x + y) })._2
+      val maxGroup = if (stepOps.isEmpty()) (0, 0) else stepOps.reduce({ case ((n1, x), (n2, y)) => if (x > y) (n1, x) else (n2, y) })
+
+      //val mean = stepOps.map({ case (n1, x) => n1 * x }).reduce({ case (x1, x2) => x1 + x2 }) / numBuckets
+      //val desv = Math.sqrt(stepOps.map({ case (n, x) => (x - mean) * (x - mean) * n }).reduce({ case (d1, d2) => d1 + d2 }) / numBuckets)
+
+      if ((stepOps.isEmpty() || tmpHasher.keyLength < hasher.keyLength / 2) && !upFlag) {
+        radius *= 2
+        tmpHasher = tmpHasher.update(hasher.keyLength, tmpHasher.numTables)
+        tmpHash = getHashes(currentData, tmpHasher, radius)
+        update = true
+      } else {
+        //if (numBuckets * 0.5 < maxGroup._2)
+        val elems = stepOps.map({ case (n1, x) => n1 })
+        val mean = elems.reduce({ case (n1, n2) => n1 + n2 }) * 1.0 / elems.count()
+        val desv = Math.sqrt(elems.map({ case n => (n - mean) * (n - mean) }).reduce({ case (n1, n2) => n1 + n2 }) * 1.0 / elems.count())
+        val maxElems = stepOps.reduce({ case ((n1, x), (n2, y)) => if (n1 > n2) (n1, x) else (n2, y) })._1
+        if (numBuckets * 0.5 < maxGroup._2 && (maxElems < mean + 3 * desv || desv == 0)) {
+          tmpHasher = tmpHasher.update(tmpHasher.keyLength - 2, tmpHasher.numTables)
+          downFlag = true
+          update = !upFlag
+        }
+        else if (!downFlag) {
+          tmpHasher = tmpHasher.update(tmpHasher.keyLength + 2, tmpHasher.numTables)
+          update = true
+          upFlag = true
+        }
+      }
+
+      stepOps.sortBy(_._1).repartition(1)
+        .foreach({ case x => println(x._2 + " buckets with " + x._1 + " elements") })
+
+      if (update) {
+        println("keyLength update to " + tmpHasher.keyLength + " with radius " + radius)
+      } else {
+        println("keyLength set to " + tmpHasher.keyLength + " with radius " + radius)
+      }
+
+
+    } while (update)
+    (tmpHasher.keyLength, radius)
+  }
+
+  protected def log2(n: Double): Double = {
+    Math.log10(n) / Math.log10(2)
+  }
+
+  def computeGroupedGraph(data: RDD[(LabeledPoint, Long)], numNeighbors: Int, dimension: Int, hasherKeyLength: Int, hasherNumTables: Int, startRadius: Double, maxComparisonsPerItem: Int, measurer: DistanceProvider, grouper: GroupingProvider, factor: Double): RDD[(Long, List[(Int, List[(Long, Double)])])]
   = {
     var hKLength: Int = hasherKeyLength
     var hNTables: Int = hasherNumTables
     var mComparisons: Int = maxComparisonsPerItem
+    var radius = startRadius
 
-    if (hKLength <= 0)
-      hKLength = Math.floor(Math.sqrt(dimension) + Math.sqrt(data.count() / dimension) - 10).toInt
-    if (hNTables <= 0)
-      hNTables = (hKLength / 2 + 1) * (hKLength / 2 + 1)
-    if (mComparisons <= 0)
-      mComparisons = hNTables
+    if (hKLength <= 0) {
+      //hKLength = Math.floor(Math.sqrt(dimension) + Math.sqrt(data.count() / dimension) - 10).toInt
+      hKLength = Math.floor(log2(data.count() * dimension)).toInt
+      val (hK, r) = computeBestKeyLength(data, hKLength, new EuclideanLSHasher(dimension, hKLength, 1), radius)
+      hKLength = hK
+      radius = r
+    }
+    if (hNTables <= 0) {
+      //hNTables = (hKLength / 2 + 1) * (hKLength / 2 + 1)
+      hNTables = Math.floor(Math.pow(log2(dimension), 2) * factor).toInt
+    }
+    if (mComparisons <= 0) {
+      //mComparisons = hNTables
+      mComparisons = Math.abs(Math.ceil(hNTables * Math.sqrt(factor) * Math.sqrt(log2(data.count()/(dimension*0.1))))).toInt
+    }
 
-    println("R0:" + startRadius + " num_tables:" + hNTables + " keyLength:" + hKLength + " maxComparisons:" + mComparisons)
+    println("R0:" + radius + " num_tables:" + hNTables + " keyLength:" + hKLength + " maxComparisons:" + mComparisons)
 
     return computeGroupedGraph(data,
       numNeighbors,
       dimension,
       new EuclideanLSHasher(dimension, hKLength, hNTables), //Default to an EuclideanHasher
-      startRadius,
+      radius,
       mComparisons,
       measurer,
       grouper)
   }
 
-  def computeGraph(data: RDD[(LabeledPoint, Long)], numNeighbors: Int, dimension: Int, hasherKeyLength: Int, hasherNumTables: Int, startRadius: Double, maxComparisonsPerItem: Int, measurer: DistanceProvider): RDD[(Long, List[(Long, Double)])] = {
-    val graph = computeGroupedGraph(data, numNeighbors, dimension, hasherKeyLength, hasherNumTables, startRadius, maxComparisonsPerItem, measurer, new DummyGroupingProvider())
+  def computeGraph(data: RDD[(LabeledPoint, Long)], numNeighbors: Int, dimension: Int, hasherKeyLength: Int, hasherNumTables: Int, startRadius: Double, maxComparisonsPerItem: Int, measurer: DistanceProvider, factor: Double): RDD[(Long, List[(Long, Double)])] = {
+    val graph = computeGroupedGraph(data, numNeighbors, dimension, hasherKeyLength, hasherNumTables, startRadius, maxComparisonsPerItem, measurer, new DummyGroupingProvider(), factor)
     return graph.map(
       {
         case (index, groupedNeighs) => (index, groupedNeighs.head._2)
       })
   }
 
-  def computeGraph(data: RDD[(LabeledPoint, Long)], numNeighbors: Int, hasherKeyLength: Int, hasherNumTables: Int, startRadius: Double, maxComparisonsPerItem: Int, measurer: DistanceProvider): RDD[(Long, List[(Long, Double)])]
+  def computeGraph(data: RDD[(LabeledPoint, Long)], numNeighbors: Int, hasherKeyLength: Int, hasherNumTables: Int, startRadius: Double, maxComparisonsPerItem: Int, measurer: DistanceProvider, factor: Double): RDD[(Long, List[(Long, Double)])]
   = computeGraph(data,
     numNeighbors,
     data.map({ case (point, index) => point.features.size }).max(), //Get dimension from dataset
@@ -261,9 +351,10 @@ abstract class LSHKNNGraphBuilder {
     hasherNumTables,
     startRadius,
     maxComparisonsPerItem,
-    measurer)
+    measurer,
+    factor)
 
-  def computeGroupedGraph(data: RDD[(LabeledPoint, Long)], numNeighbors: Int, hasherKeyLength: Int, hasherNumTables: Int, startRadius: Double, maxComparisonsPerItem: Int, measurer: DistanceProvider, grouper: GroupingProvider): RDD[(Long, List[(Int, List[(Long, Double)])])]
+  def computeGroupedGraph(data: RDD[(LabeledPoint, Long)], numNeighbors: Int, hasherKeyLength: Int, hasherNumTables: Int, startRadius: Double, maxComparisonsPerItem: Int, measurer: DistanceProvider, grouper: GroupingProvider, factor: Double): RDD[(Long, List[(Int, List[(Long, Double)])])]
   = computeGroupedGraph(data,
     numNeighbors,
     data.map({ case (point, index) => point.features.size }).max(), //Get dimension from dataset
@@ -272,7 +363,8 @@ abstract class LSHKNNGraphBuilder {
     startRadius,
     maxComparisonsPerItem,
     measurer,
-    grouper)
+    grouper,
+    factor)
 
   protected def splitLargeBuckets(data: RDD[(LabeledPoint, Long)], hashBuckets: RDD[(Hash, Iterable[Long], Int)], maxBucketSize: Int, radius: Double, hasher: Hasher): RDD[(Hash, Iterable[Long], Int)]
 

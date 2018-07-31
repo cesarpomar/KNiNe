@@ -17,14 +17,22 @@ class Hash(var values: Array[Integer]) extends Serializable {
   def concat(other: Hash): Hash = {
     return new Hash(this.values ++ other.values)
   }
+
+  def cutLen(len: Int): Hash = {
+    return new Hash(this.values.slice(0, len))
+  }
 }
 
-trait Hasher extends Serializable {
+abstract class Hasher(kLength: Int, nTables: Int) extends Serializable {
   protected def _init(): Unit
 
   this._init()
+  val numTables = nTables
+  val keyLength = kLength
 
   def getHashes(point: Vector, index: Long, radius: Double): List[(Hash, Long)]
+
+  def update(kLength: Int, nTables: Int): Hasher
 }
 
 object Hasher {
@@ -32,14 +40,16 @@ object Hasher {
   val DEFAULT_KEY_LENGTH = 3
 }
 
-class EuclideanLSHasher(dimension: Int, kLength: Int, nTables: Int) extends Hasher {
+class EuclideanLSHasher(dimension: Int, kLength: Int, nTables: Int) extends Hasher(kLength, nTables) {
   private val OptimalW = 4
-  val numTables = nTables
-  val keyLength = kLength
   val w = OptimalW
 
   val gaussianVectors = ofDim[Double](numTables, keyLength, dimension)
   val b = ofDim[Double](numTables, keyLength)
+
+  override def update(kLength: Int, nTables: Int): Hasher = {
+    new EuclideanLSHasher(dimension, kLength, nTables)
+  }
 
   override protected def _init(): Unit = {
     val randomGenerator = new Random()

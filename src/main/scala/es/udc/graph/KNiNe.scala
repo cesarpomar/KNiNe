@@ -7,6 +7,7 @@ import org.apache.spark.mllib.util.MLUtils
 import org.apache.spark.SparkConf
 import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
 import org.apache.hadoop.fs.Path
+import java.io._
 
 import Array._
 import org.apache.spark.mllib.linalg.Vectors
@@ -18,7 +19,7 @@ import sys.process._
 
 object sparkContextSingleton {
   @transient private var instance: SparkContext = _
-  private val conf: SparkConf = new SparkConf().setAppName("KNiNe")
+  final val conf: SparkConf = new SparkConf().setAppName("KNiNe")
     //.setMaster("local[4]")
     .set("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
     .set("spark.broadcast.factory", "org.apache.spark.broadcast.HttpBroadcastFactory")
@@ -50,12 +51,16 @@ object KNiNeConfiguration {
       options("max_comparisons").asInstanceOf[Double].toInt
     else
       -1
-    return new KNiNeConfiguration(numTables, keyLength, maxComparisons, radius0)
+    val factor: Double = if (options.exists(_._1 == "factor"))
+      options("factor").asInstanceOf[Double].toDouble
+    else
+      1
+    return new KNiNeConfiguration(numTables, keyLength, maxComparisons, radius0, factor)
   }
 }
 
-class KNiNeConfiguration(val numTables: Int, val keyLength: Int, val maxComparisons: Int, val radius0: Double) {
-  def this() = this(-1, -1, -1, LSHKNNGraphBuilder.DEFAULT_RADIUS_START)
+class KNiNeConfiguration(val numTables: Int, val keyLength: Int, val maxComparisons: Int, val radius0: Double, val factor: Double) {
+  def this() = this(-1, -1, -1, LSHKNNGraphBuilder.DEFAULT_RADIUS_START, 1)
 
   override def toString(): String = {
     return "R0=" + this.radius0 + ";NT=" + this.numTables + ";KL=" + this.keyLength + ";MC=" + this.maxComparisons
@@ -79,9 +84,12 @@ Options:
         """)
     -t    Maximum comparisons per item (default: auto)
     -c    File containing the graph to compare to (default: nothing)
-    -g    Redirect stdout and stderr to a file
+    -g    Redirect stdout and stderr to a file (default: disabled)
+    -p    Number of cores for a local execution (default: disabled)
 
 Advanced LSH options:
+    -f    Accuracy factor, values greater than 1 increase accuracy and values
+            between 0 and 1 reduce the number of operations and execution time. (default: 1)
     -n    Number of hashes per item (default: auto)
     -l    Hash length (default: auto)""")
     System.exit(-1)
@@ -113,6 +121,8 @@ Advanced LSH options:
         case "t" => "max_comparisons"
         case "c" => "compare"
         case "g" => "log"
+        case "p" => "cores"
+        case "f" => "factor"
         case somethingElse => readOptionName
       }
       if (!m.keySet.exists(_ == option) && option == readOptionName) {
@@ -170,6 +180,10 @@ Advanced LSH options:
     //println("Using "+method+" to compute "+numNeighbors+"NN graph for dataset "+justFileName)
     //println("R0:"+radius0+(if (numTables!=null)" num_tables:"+numTables else "")+(if (keyLength!=null)" keyLength:"+keyLength else "")+(if (maxComparisons!=null)" maxComparisons:"+maxComparisons else ""))
 
+    if (options.exists(_._1 == "cores")) {
+      sparkContextSingleton.conf.setMaster("local[" + options("cores").asInstanceOf[Double].toInt + "]")
+    }
+
     //Set up Spark Context
     val sc = sparkContextSingleton.getInstance()
 
@@ -226,7 +240,7 @@ Advanced LSH options:
     val (graph, lookup) = if (method == "lsh") {
       /* LOOKUP VERSION */
       builder = new LSHLookupKNNGraphBuilder(data)
-      (builder.computeGraph(data, numNeighbors, kNiNeConf.keyLength, kNiNeConf.numTables, kNiNeConf.radius0, kNiNeConf.maxComparisons, new EuclideanDistanceProvider()), builder.lookup)
+      (builder.computeGraph(data, numNeighbors, kNiNeConf.keyLength, kNiNeConf.numTables, kNiNeConf.radius0, kNiNeConf.maxComparisons, new EuclideanDistanceProvider(), kNiNeConf.factor), builder.lookup)
     }
     else
     /* BRUTEFORCE VERSION */
@@ -319,9 +333,20 @@ Advanced LSH options:
   def getFullResultFile(fileName: String, sc: SparkContext): String = {
     if (new Path(fileName).getFileSystem(sc.hadoopConfiguration)
       .isInstanceOf[org.apache.hadoop.fs.LocalFileSystem]) {
-      //println("Executing /home/eirasf/Escritorio/kNNTEMP/joinParts.sh "+fileName)
-      ("/home/eirasf/Escritorio/datasets-kNN/scripts/joinParts.sh " + fileName).!
-      return fileName + "/result"
+      val out = new FileOutputStream(fileName + "/joined")
+      val buffer = Array.fill[Byte](1024 * 1024)(0)
+      var len = 0
+      for (file <- new File(fileName).list().sorted.filter({ case s => s.startsWith("part-") })) {
+        val in = new FileInputStream(fileName + "/" + file)
+        len = in.read(buffer)
+        while (len != -1) {
+          out.write(buffer, 0, len)
+          len = in.read(buffer)
+        }
+        in.close()
+      }
+      out.close()
+      return fileName + "/joined"
     } else {
       var fs = org.apache.hadoop.fs.FileSystem.get(sc.hadoopConfiguration)
       var fileNameAbs = fs.getFileStatus(new org.apache.hadoop.fs.Path(fileName)).getPath.toString
