@@ -309,7 +309,7 @@ abstract class LSHKNNGraphBuilder {
 
     if (hKLength <= 0) {
       //hKLength = Math.floor(Math.sqrt(dimension) + Math.sqrt(data.count() / dimension) - 10).toInt
-      hKLength = Math.floor(log2(data.count() * dimension)).toInt
+      hKLength = Math.ceil(log2(data.count() / dimension)).toInt + 1
       val (hK, r) = computeBestKeyLength(data, hKLength, new EuclideanLSHasher(dimension, hKLength, 1), radius)
       hKLength = hK
       radius = r
